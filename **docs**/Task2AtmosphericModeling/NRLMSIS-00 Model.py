@@ -1,210 +1,133 @@
-import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
-import pymsis
+"""
+run_msis_analog_predictor.py
+============================
+Builds (or reloads) the NRLMSIS-00 kNN analog predictor.
+
+Workflow
+--------
+  1. If a saved predictor already exists → load it, jump to query.
+  2. Otherwise:
+       a. Load the NRLMSIS-00 daily-average output CSV produced by
+          your existing pymsis script (output_daily.csv).
+       b. Build the feature DataFrame from the raw space-weather CSV.
+       c. Fit the predictor, save it to disk, then launch the query.
+
+Expected daily CSV columns  (from your pymsis aggregation step)
+---------------------------------------------------------------
+  Year, Month, Day, lat, lon, alt_km,
+  F107, F107A, Ap_daily,
+  Density_mean_kg_m3, Atomic_O_mean_m3
+
+pymsis output-index note
+------------------------
+  pymsis.calculate() returns a (..., 11) array where:
+    index 0  →  total mass density  [kg/m³]  ← Density_kg_m3
+    index 1  →  N₂ number density   [m⁻³]
+    index 3  →  O  number density   [m⁻³]   ← correct Atomic O
+  If your CSV was produced with msis_output[:, 1] labelled as
+  'Atomic_O_density_m3', it actually contains N₂, not O.
+  To fix, re-run the pymsis script with msis_output[:, 3] for atomic O
+  and regenerate output_daily.csv before rebuilding the predictor.
+"""
+
 import os
+import numpy as np
+import pandas as pd
 
-# ============================================================
-# USER SETTINGS
-# ============================================================
-
-INPUT_CSV = r"C:\Users\jorda\OneDrive - Massachusetts Institute of Technology\Documents\Summer 26\space_weather_daily_1996_2025.csv"
-
-# Output files
-OUTPUT_SUBDAILY = r"C:\Users\jorda\OneDrive - Massachusetts Institute of Technology\Documents\Summer 26\output_subdaily.csv"
-OUTPUT_DAILY = r"C:\Users\jorda\OneDrive - Massachusetts Institute of Technology\Documents\Summer 26\output_daily.csv"
-OUTPUT_MONTHLY = r"C:\Users\jorda\OneDrive - Massachusetts Institute of Technology\Documents\Summer 26\output_monthly.csv"
-
-# Fixed geographic location
-LATITUDE = 0.0      # degrees
-LONGITUDE = 0.0     # degrees
-
-# Altitudes to evaluate [km]
-ALTITUDES_KM = [200, 225, 250, 275, 300]
-
-# Times per day to sample [UTC hours]
-HOURS_UTC = [0, 6, 12, 18]
-
-
-# Ensure output directory exists
-output_dir = os.path.dirname(OUTPUT_SUBDAILY)
-os.makedirs(output_dir, exist_ok=True)
-print(f"Output directory confirmed: {output_dir}")
-
-# ============================================================
-# LOAD INPUT DATA
-# ============================================================
-
-df = pd.read_csv(INPUT_CSV)
-
-# Standardize column names if needed
-df.columns = [c.strip() for c in df.columns]
-
-# Create datetime column
-df["Date"] = pd.to_datetime(df[["Year", "Month", "Day"]])
-
-# Sort by date
-df = df.sort_values("Date").reset_index(drop=True)
-
-# ============================================================
-# COMPUTE 81-DAY F10.7 AVERAGE
-# ============================================================
-
-# Use centered rolling mean if enough data exists on both sides.
-# Near edges, min_periods=1 prevents NaNs, but is less ideal physically.
-df["F107A"] = df["F107_adj"].rolling(window=81, center=True, min_periods=1).mean()
-
-# ============================================================
-# BUILD SUB-DAILY EVALUATION GRID
-# ============================================================
-
-rows = []
-
-for _, row in df.iterrows():
-    base_date = row["Date"]
-
-    for hour in HOURS_UTC:
-        dt = base_date + pd.Timedelta(hours=hour)
-
-        for alt in ALTITUDES_KM:
-            rows.append({
-                "datetime": dt,
-                "Year": row["Year"],
-                "Month": row["Month"],
-                "Day": row["Day"],
-                "Hour_UTC": hour,
-                "lat": LATITUDE,
-                "lon": LONGITUDE,
-                "alt_km": alt,
-                "Ap_daily": row["Ap_daily"],
-                "F107": row["F107_adj"],
-                "F107A": row["F107A"]
-            })
-
-grid = pd.DataFrame(rows)
-
-# ============================================================
-# PREPARE INPUTS FOR PYMSIS
-# ============================================================
-
-dates = pd.to_datetime(grid["datetime"]).to_numpy()
-lons = grid["lon"].to_numpy()
-lats = grid["lat"].to_numpy()
-alts = grid["alt_km"].to_numpy()
-f107 = grid["F107"].to_numpy(dtype=float)
-f107a = grid["F107A"].to_numpy(dtype=float)
-
-# pymsis expects aps as an (n, 7) array for each timestamp.
-# If you only have one daily Ap value per row, repeat it across the
-# seven MSIS Ap columns as a simple approximation.
-aps = np.repeat(grid["Ap_daily"].to_numpy(dtype=float)[:, None], 7, axis=1)
-
-# ============================================================
-# RUN NRLMSISE-00
-# ============================================================
-
-# pymsis.run returns an array of atmospheric outputs.
-# One of the outputs is total mass density.
-# Depending on pymsis version, output indexing may differ slightly.
-# In many versions:
-#   output[:, 0] = total mass density [kg/m^3]
-# Check package docs if needed.
-
-msis_output = pymsis.calculate(
-    dates=dates,
-    lons=lons,
-    lats=lats,
-    alts=alts,
-    f107s=f107,
-    f107as=f107a,
-    aps=aps
+from msis_dtm_analog_predictor import (
+    build_feature_df_msis,
+    AtmosphericAnalogPredictor,
+    terminal_query,
 )
 
-# Grab the outputs from msis
-grid["Density_kg_m3"] = msis_output[:, 0]
-grid["Atomic_O_density_m3"] = msis_output[:, 1]
-
-# ============================================================
-# SAVE SUB-DAILY RESULTS
-# ============================================================
-
-grid.to_csv(OUTPUT_SUBDAILY, index=False)
-print(f"Saved sub-daily results to {OUTPUT_SUBDAILY}")
-
-# ============================================================
-# DAILY AVERAGES
-# ============================================================
-
-daily = (
-    grid.groupby(["Year", "Month", "Day", "lat", "lon", "alt_km"], as_index=False)
-        .agg({
-            "F107": "first",
-            "F107A": "first",
-            "Ap_daily": "first",
-            "Density_kg_m3": ["mean", "std", "min", "max"],
-            "Atomic_O_density_m3": ["mean", "std", "min", "max"]
-        })
+# ── USER SETTINGS ─────────────────────────────────────────────────────────────
+SW_CSV    = (
+    r"C:\Users\jorda\OneDrive - Massachusetts Institute of Technology"
+    r"\Documents\Summer 26\space_weather_daily_may_1996_2026.csv"
 )
+DAILY_CSV = (
+    r"C:\Users\jorda\OneDrive - Massachusetts Institute of Technology"
+    r"\Documents\Summer 26\output_daily.csv"
+)
+OUTPUT_DIR     = (
+    r"C:\Users\jorda\OneDrive - Massachusetts Institute of Technology"
+    r"\Documents\Summer 26"
+)
+PREDICTOR_PATH = os.path.join(OUTPUT_DIR, "msis_analog_predictor.pkl")
+ALTITUDES_KM   = [200, 225, 250, 275, 300]
 
-daily.columns = [
-    "Year", "Month", "Day", "lat", "lon", "alt_km",
-    "F107", "F107A", "Ap_daily",
-    "Density_mean_kg_m3", "Density_std_kg_m3", "Density_min_kg_m3", "Density_max_kg_m3",
-    "Atomic_O_mean_m3", "Atomic_O_std_m3", "Atomic_O_min_m3", "Atomic_O_max_m3"
-]
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+# ── LOAD EXISTING PREDICTOR IF AVAILABLE ──────────────────────────────────────
+if os.path.exists(PREDICTOR_PATH):
+    print(f"Loading existing predictor:\n  {PREDICTOR_PATH}")
+    predictor = AtmosphericAnalogPredictor.load(PREDICTOR_PATH)
+    terminal_query(predictor, output_dir=OUTPUT_DIR)
+    raise SystemExit
+
+# ── LOAD NRLMSIS-00 DAILY OUTPUT ──────────────────────────────────────────────
+print(f"Loading NRLMSIS-00 daily output:\n  {DAILY_CSV}")
+daily = pd.read_csv(DAILY_CSV)
 daily["Date"] = pd.to_datetime(daily[["Year", "Month", "Day"]])
+daily = daily.sort_values(["Date", "alt_km"]).reset_index(drop=True)
 
-daily.to_csv(OUTPUT_DAILY, index=False)
-print(f"Saved daily averages to {OUTPUT_DAILY}")
+dates_all = pd.DatetimeIndex(sorted(daily["Date"].unique()))
+print(f"  {len(dates_all)} unique dates  |  altitudes: {ALTITUDES_KM} km")
 
-# ============================================================
-# MONTHLY AVERAGES
-# ============================================================
-
-monthly = (
-    daily.groupby(["Year", "Month", "lat", "lon", "alt_km"], as_index=False)
-         .agg({
-             "F107": "mean",
-             "F107A": "mean",
-             "Ap_daily": "mean",
-             "Density_mean_kg_m3": ["mean", "std", "min", "max"]
-         })
+# ── PIVOT TO (n_times, n_alts) ARRAYS ─────────────────────────────────────────
+#  pivot_table handles any accidental duplicate (Date, alt_km) rows by averaging
+density_pivot  = daily.pivot_table(
+    index="Date", columns="alt_km",
+    values="Density_mean_kg_m3", aggfunc="mean"
+)
+atomic_O_pivot = daily.pivot_table(
+    index="Date", columns="alt_km",
+    values="Atomic_O_mean_m3", aggfunc="mean"
 )
 
-monthly.columns = [
-    "Year", "Month", "lat", "lon", "alt_km",
-    "F107_monthly_mean",
-    "F107A_monthly_mean",
-    "Ap_monthly_mean",
-    "Density_monthly_mean_kg_m3",
-    "Density_monthly_std_kg_m3",
-    "Density_monthly_min_kg_m3",
-    "Density_monthly_max_kg_m3"
-]
-# Save daily results
-print(f"Saved daily averages to {OUTPUT_DAILY}")
+density_pivot  = density_pivot.reindex(index=dates_all,  columns=ALTITUDES_KM)
+atomic_O_pivot = atomic_O_pivot.reindex(index=dates_all, columns=ALTITUDES_KM)
 
-# ============================================================
-# EXPORT ATOMIC OXYGEN DAILY AVERAGES AS SEPARATE EXCEL FILES
-# ============================================================
-# ============================================================
+density_array  = density_pivot.values.astype(float)
+atomic_O_array = atomic_O_pivot.values.astype(float)
 
-altitudes_to_export = [200, 225, 250, 275, 300]
+# Sanity check – total density at 200 km should be ~1e-10 to 1e-9 kg/m³
+med_rho_200 = np.nanmedian(density_array[:, ALTITUDES_KM.index(200)])
+if not (1e-13 < med_rho_200 < 1e-7):
+    print(f"  WARNING: median density at 200 km = {med_rho_200:.3e} kg/m³ "
+          "– expected ~1e-10 kg/m³. Verify the Density_mean_kg_m3 column units.")
 
-for alt in altitudes_to_export:
-    df_alt = daily[daily["alt_km"] == alt][["Date", "Atomic_O_mean_m3"]].copy()
-    df_alt["Date"] = df_alt["Date"].dt.strftime("%m/%d/%Y")
-    
-    output_file = os.path.join(output_dir, f"atomic_oxygen_{alt}km.csv")
-    df_alt.to_csv(output_file, index=False)
-    
-    print(f"Saved atomic oxygen file: {output_file}")
+n_nan_rho = np.isnan(density_array).sum()
+n_nan_O   = np.isnan(atomic_O_array).sum()
+if n_nan_rho or n_nan_O:
+    print(f"  WARNING: {n_nan_rho} NaN density values, "
+          f"{n_nan_O} NaN atomic-O values after pivot.")
 
-# Optional: make a month-start datetime column for plotting
-monthly["Date"] = pd.to_datetime(
-    monthly["Year"].astype(str) + "-" + monthly["Month"].astype(str) + "-01"
+# ── BUILD FEATURE DATAFRAME ───────────────────────────────────────────────────
+print("\nBuilding feature DataFrame from space-weather CSV...")
+feature_df = build_feature_df_msis(
+    dates       = dates_all,
+    sw_csv_path = SW_CSV,
+    f107_col    = "F107_adj",
+    ap_col      = "Ap_daily",
+    include_doy = True,
+)
+print(f"  Feature columns : {list(feature_df.columns)}")
+print(f"  Shape           : {feature_df.shape}")
+
+# ── FIT PREDICTOR ─────────────────────────────────────────────────────────────
+predictor = AtmosphericAnalogPredictor(model_name="NRLMSIS-00")
+predictor.fit(
+    dates          = dates_all,
+    feature_df     = feature_df,
+    density_array  = density_array,
+    atomic_O_array = atomic_O_array,
+    altitudes_km   = ALTITUDES_KM,
 )
 
-monthly.to_csv(OUTPUT_MONTHLY, index=False)
-print(f"Saved monthly averages to {OUTPUT_MONTHLY}")
+# ── SAVE TO DISK ──────────────────────────────────────────────────────────────
+predictor.save(PREDICTOR_PATH)
+print(f"Predictor saved to:\n  {PREDICTOR_PATH}")
+
+# ── LAUNCH INTERACTIVE QUERY ──────────────────────────────────────────────────
+terminal_query(predictor, output_dir=OUTPUT_DIR)
