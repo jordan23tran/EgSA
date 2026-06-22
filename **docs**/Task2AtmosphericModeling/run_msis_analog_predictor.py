@@ -9,7 +9,7 @@ Workflow
   2. Otherwise:
        a. Load the NRLMSIS-00 daily-average output CSV produced by
           your existing pymsis script (output_daily.csv). 
-          OBTAIN out_daily.csv BY RUNNING THE NRLMSIS-00 SCRIPT
+          OBTAIN out_daily.csv BY RUNNING THE NRLMSIS-00 MODEL SCRIPT
        b. Build the feature DataFrame from the raw space-weather CSV.
        c. Fit the predictor, save it to disk, then launch the query.
 
