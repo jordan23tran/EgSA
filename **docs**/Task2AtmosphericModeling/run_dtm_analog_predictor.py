@@ -1,10 +1,15 @@
 """
 run_dtm_analog_predictor.py
 ============================
-Builds (or reloads) the DTM-2020 (SWAMI MCM) kNN analog predictor.
+Builds (or reloads) the DTM-2020 (SWAMI MCM) kNN analog predictor. YOU MUST HAVE run_dtm installed and FUNCTIONING for this file to work.
 
 Workflow
 --------
+  1. Open WSL environment
+  2. cd to the file that houses this folder and your run_dtm
+  3. Execute **python run_dtm_analog_predictor.py** command in terminal
+  4. Follow HOW TO USE QUERY instructions
+  NOTE: 
   1. If a saved predictor already exists → load it, jump to query.
   2. Otherwise:
        a. Load the MCM combined results CSV (mcm_results_all_altitudes.csv).
@@ -18,6 +23,17 @@ Expected MCM results CSV columns
   O_number_density_m3,  <density_col>  (e.g. 'rho')
   (plus any additional SWAMI output fields: d_O, t_exo, t, …)
 
+HOW TO USE QUERY
+---------------------------------
+F10.7 and K input is self-explanatory
+DOY:The target date in the future you are modelling
+K and method: Just hit enter for defaults
+
+HOW TO READ OUTPUTS
+---------------------------------
+Dist: How different the input data is, 0.0 is perfect match, ~2.0 is small and a close analog, >>5 is large and a poor analog.
+Weight: The higher the more accurate, weights add up to one for all the analogs.
+
 Density column
 --------------
   DENSITY_COL  : set to None for auto-detection from candidate names,
@@ -26,6 +42,7 @@ Density column
                             SWAMI MCM typically outputs rho in g/cm³.
                  'kg_m3' → no conversion needed.
   Verify by checking that the median density at 200 km ≈ 1e-10 kg/m³.
+--------------
 """
 
 import os
@@ -49,7 +66,7 @@ PREDICTOR_PATH = os.path.join(OUTPUT_DIR, "dtm2020_analog_predictor.pkl")
 ALTITUDES_KM   = [200, 225, 250, 275, 300]
 
 # Density column settings
-DENSITY_COL  = None        # None → auto-detect; or set explicitly e.g. "rho"
+DENSITY_COL  = "dens"        # None → auto-detect; or set explicitly e.g. "rho"
 DENSITY_UNIT = "g_cm3"     # "g_cm3" converts ×1000 → kg/m³  |  "kg_m3" = no-op
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
