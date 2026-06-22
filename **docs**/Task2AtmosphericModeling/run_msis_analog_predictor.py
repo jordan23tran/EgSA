@@ -8,9 +8,21 @@ Workflow
   1. If a saved predictor already exists → load it, jump to query.
   2. Otherwise:
        a. Load the NRLMSIS-00 daily-average output CSV produced by
-          your existing pymsis script (output_daily.csv).
+          your existing pymsis script (output_daily.csv). 
+          OBTAIN out_daily.csv BY RUNNING THE NRLMSIS-00 SCRIPT
        b. Build the feature DataFrame from the raw space-weather CSV.
        c. Fit the predictor, save it to disk, then launch the query.
+
+HOW TO USE QUERY
+---------------------------------
+F10.7 and K input is self-explanatory
+DOY:The target date in the future you are modelling
+K and method: Just hit enter for defaults
+
+HOW TO READ OUTPUTS
+---------------------------------
+Dist: How different the input data is, 0.0 is perfect match, ~2.0 is small and a close analog, >>5 is large and a poor analog.
+Weight: The higher the more accurate, weights add up to one for all the analogs.
 
 Expected daily CSV columns  (from your pymsis aggregation step)
 ---------------------------------------------------------------
