@@ -1,145 +1,190 @@
 """
-run_msis_analog_predictor.py
-============================
-Builds (or reloads) the NRLMSIS-00 kNN analog predictor.
-
-Workflow
---------
-  1. If a saved predictor already exists → load it, jump to query.
-  2. Otherwise:
-       a. Load the NRLMSIS-00 daily-average output CSV produced by
-          your existing pymsis script (output_daily.csv). 
-          OBTAIN out_daily.csv BY RUNNING THE NRLMSIS-00 MODEL SCRIPT
-       b. Build the feature DataFrame from the raw space-weather CSV.
-       c. Fit the predictor, save it to disk, then launch the query.
+JB2008 daily atmosphere from 1997-01-01 to 2026-04-27
+at 200, 225, 250, 275, 300 km and (0N, 0E).
+Now includes kNN analog predictor built from the JB2008 output.
+1. Create a venv in python 3.10 and install numpy, pandas, matplot, pyatmos
+2. Make sure the jb_2008_analog_predictor is in the same folder. 
+3. The first time you run this file you create the pkl file, next time you run it, the script uses the pkl file.
 
 HOW TO USE QUERY
 ---------------------------------
-F10.7 and K input is self-explanatory
-DOY:The target date in the future you are modelling
+Inputs are self-explanatory except for:
+DOY: The target date in the future you are modelling
 K and method: Just hit enter for defaults
 
 HOW TO READ OUTPUTS
 ---------------------------------
 Dist: How different the input data is, 0.0 is perfect match, ~2.0 is small and a close analog, >>5 is large and a poor analog.
 Weight: The higher the more accurate, weights add up to one for all the analogs.
-
-Expected daily CSV columns  (from your pymsis aggregation step)
----------------------------------------------------------------
-  Year, Month, Day, lat, lon, alt_km,
-  F107, F107A, Ap_daily,
-  Density_mean_kg_m3, Atomic_O_mean_m3
-
-pymsis output-index note
-------------------------
-  pymsis.calculate() returns a (..., 11) array where:
-    index 0  →  total mass density  [kg/m³]  ← Density_kg_m3
-    index 1  →  N₂ number density   [m⁻³]
-    index 3  →  O  number density   [m⁻³]   ← correct Atomic O
-  If your CSV was produced with msis_output[:, 1] labelled as
-  'Atomic_O_density_m3', it actually contains N₂, not O.
-  To fix, re-run the pymsis script with msis_output[:, 3] for atomic O
-  and regenerate output_daily.csv before rebuilding the predictor.
 """
+
+import ssl
+ssl._create_default_https_context = ssl._create_unverified_context
 
 import os
 import numpy as np
 import pandas as pd
-
-from msis_dtm_analog_predictor import (
-    build_feature_df_msis,
-    AtmosphericAnalogPredictor,
-    terminal_query,
-)
+import matplotlib.pyplot as plt
+from datetime import timezone
 
 # ── USER SETTINGS ─────────────────────────────────────────────────────────────
-SW_CSV    = (
-    r"C:\Users\jorda\OneDrive - Massachusetts Institute of Technology"
-    r"\Documents\Summer 26\space_weather_daily_may_1996_2026.csv"
-)
-DAILY_CSV = (
-    r"C:\Users\jorda\OneDrive - Massachusetts Institute of Technology"
-    r"\Documents\Summer 26\output_daily.csv"
-)
-OUTPUT_DIR     = (
-    r"C:\Users\jorda\OneDrive - Massachusetts Institute of Technology"
-    r"\Documents\Summer 26"
-)
-PREDICTOR_PATH = os.path.join(OUTPUT_DIR, "msis_analog_predictor.pkl")
-ALTITUDES_KM   = [200, 225, 250, 275, 300]
+lat_deg      = 0.0
+lon_deg      = 0.0
+altitudes_km = [200, 225, 250, 275, 300]
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+input_csv  = r"C:\Users\jorda\OneDrive - Massachusetts Institute of Technology\Documents\Summer 26\space_weather_daily_may_1996_2026.csv"
+output_dir = r"C:\Users\jorda\OneDrive - Massachusetts Institute of Technology\Documents\Summer 26"
 
-# ── LOAD EXISTING PREDICTOR IF AVAILABLE ──────────────────────────────────────
+SOLFSMY_PATH   = r"C:\Users\jorda\src\sw-data\SOLFSMY.TXT"
+DTCFILE_PATH   = r"C:\Users\jorda\src\sw-data\DTCFILE.TXT"
+PREDICTOR_PATH = os.path.join(output_dir, "jb2008_analog_predictor.pkl")
+
+# ── IMPORTS ───────────────────────────────────────────────────────────────────
+from pyatmos import jb2008
+try:
+    from pyatmos import download_sw_jb2008, read_sw_jb2008
+except ImportError:
+    raise ImportError(
+        "Could not import JB2008 space-weather helper functions from pyatmos.\n"
+        "Try updating pyatmos, or inspect the package API for the exact helper names."
+    )
+from jb2008_analog_predictor import (
+    build_feature_df,
+    JB2008AnalogPredictor,
+    terminal_query
+)
+
+# ── PKL GUARD ─────────────────────────────────────────────────────────────────
+print(f"PKL exists : {os.path.exists(PREDICTOR_PATH)}")
+print(f"Looking at : {PREDICTOR_PATH}")
+
 if os.path.exists(PREDICTOR_PATH):
-    print(f"Loading existing predictor:\n  {PREDICTOR_PATH}")
-    predictor = AtmosphericAnalogPredictor.load(PREDICTOR_PATH)
-    terminal_query(predictor, output_dir=OUTPUT_DIR)
-    raise SystemExit
+    # ── FAST PATH: predictor already built, just load and query ───────────────
+    print(f"Loading existing predictor from:\n  {PREDICTOR_PATH}")
+    predictor = JB2008AnalogPredictor.load(PREDICTOR_PATH)
+    terminal_query(predictor, output_dir=output_dir)
 
-# ── LOAD NRLMSIS-00 DAILY OUTPUT ──────────────────────────────────────────────
-print(f"Loading NRLMSIS-00 daily output:\n  {DAILY_CSV}")
-daily = pd.read_csv(DAILY_CSV)
-daily["Date"] = pd.to_datetime(daily[["Year", "Month", "Day"]])
-daily = daily.sort_values(["Date", "alt_km"]).reset_index(drop=True)
+else:
+    # ── SLOW PATH: run JB2008, build predictor, save everything ───────────────
 
-dates_all = pd.DatetimeIndex(sorted(daily["Date"].unique()))
-print(f"  {len(dates_all)} unique dates  |  altitudes: {ALTITUDES_KM} km")
+    os.makedirs(output_dir, exist_ok=True)
 
-# ── PIVOT TO (n_times, n_alts) ARRAYS ─────────────────────────────────────────
-#  pivot_table handles any accidental duplicate (Date, alt_km) rows by averaging
-density_pivot  = daily.pivot_table(
-    index="Date", columns="alt_km",
-    values="Density_mean_kg_m3", aggfunc="mean"
-)
-atomic_O_pivot = daily.pivot_table(
-    index="Date", columns="alt_km",
-    values="Atomic_O_mean_m3", aggfunc="mean"
-)
+    # Read user CSV
+    sw_user = pd.read_csv(input_csv)
+    sw_user["Date"] = pd.to_datetime(
+        dict(year=sw_user["Year"], month=sw_user["Month"], day=sw_user["Day"]),
+        utc=True
+    )
 
-density_pivot  = density_pivot.reindex(index=dates_all,  columns=ALTITUDES_KM)
-atomic_O_pivot = atomic_O_pivot.reindex(index=dates_all, columns=ALTITUDES_KM)
+    # Build date range
+    start_date = pd.Timestamp("1997-01-01 12:00:00", tz="UTC")
+    end_date   = pd.Timestamp("2026-04-27 12:00:00", tz="UTC")
+    dates      = pd.date_range(start=start_date, end=end_date, freq="D", tz="UTC")
 
-density_array  = density_pivot.values.astype(float)
-atomic_O_array = atomic_O_pivot.values.astype(float)
+    n_times = len(dates)
+    n_alts  = len(altitudes_km)
 
-# Sanity check – total density at 200 km should be ~1e-10 to 1e-9 kg/m³
-med_rho_200 = np.nanmedian(density_array[:, ALTITUDES_KM.index(200)])
-if not (1e-13 < med_rho_200 < 1e-7):
-    print(f"  WARNING: median density at 200 km = {med_rho_200:.3e} kg/m³ "
-          "– expected ~1e-10 kg/m³. Verify the Density_mean_kg_m3 column units.")
+    # Download / read JB2008 drivers
+    print("Downloading/updating official JB2008 space-weather driver files...")
+    download_sw_jb2008()
 
-n_nan_rho = np.isnan(density_array).sum()
-n_nan_O   = np.isnan(atomic_O_array).sum()
-if n_nan_rho or n_nan_O:
-    print(f"  WARNING: {n_nan_rho} NaN density values, "
-          f"{n_nan_O} NaN atomic-O values after pivot.")
+    print("Reading official JB2008 driver data...")
+    jb_swdata = read_sw_jb2008((SOLFSMY_PATH, DTCFILE_PATH))
 
-# ── BUILD FEATURE DATAFRAME ───────────────────────────────────────────────────
-print("\nBuilding feature DataFrame from space-weather CSV...")
-feature_df = build_feature_df_msis(
-    dates       = dates_all,
-    sw_csv_path = SW_CSV,
-    f107_col    = "F107_adj",
-    ap_col      = "Ap_daily",
-    include_doy = True,
-)
-print(f"  Feature columns : {list(feature_df.columns)}")
-print(f"  Shape           : {feature_df.shape}")
+    # Storage arrays
+    rho = np.full((n_times, n_alts), np.nan)
+    T   = np.full((n_times, n_alts), np.nan)
 
-# ── FIT PREDICTOR ─────────────────────────────────────────────────────────────
-predictor = AtmosphericAnalogPredictor(model_name="NRLMSIS-00")
-predictor.fit(
-    dates          = dates_all,
-    feature_df     = feature_df,
-    density_array  = density_array,
-    atomic_O_array = atomic_O_array,
-    altitudes_km   = ALTITUDES_KM,
-)
+    # Run JB2008
+    print(f"Running JB2008 for {n_times} days x {n_alts} altitudes...")
+    for i, t in enumerate(dates):
+        if i % 500 == 0:
+            print(f"  Progress: {i:5d} / {n_times}")
 
-# ── SAVE TO DISK ──────────────────────────────────────────────────────────────
-predictor.save(PREDICTOR_PATH)
-print(f"Predictor saved to:\n  {PREDICTOR_PATH}")
+        t_py = t.to_pydatetime().replace(tzinfo=timezone.utc)
 
-# ── LAUNCH INTERACTIVE QUERY ──────────────────────────────────────────────────
-terminal_query(predictor, output_dir=OUTPUT_DIR)
+        for j, alt_km in enumerate(altitudes_km):
+            result    = jb2008(t_py, (lat_deg, lon_deg, alt_km), jb_swdata)
+            rho[i, j] = result.rho
+            T[i, j]   = result.T
+
+    print("JB2008 calculations complete.")
+
+    # Build feature DataFrame
+    print("\nBuilding feature DataFrame from SOLFSMY / DTCFILE...")
+    feature_df = build_feature_df(
+        dates        = dates,
+        solfsmy_path = SOLFSMY_PATH,
+        dtcfile_path = DTCFILE_PATH,
+        include_dtc  = True,
+        include_doy  = True,
+    )
+    print(f"Feature columns : {list(feature_df.columns)}")
+    print(f"Feature matrix  : {feature_df.shape}")
+
+    # Fit predictor
+    predictor = JB2008AnalogPredictor()
+    predictor.fit(
+        dates        = dates,
+        feature_df   = feature_df,
+        rho_array    = rho,
+        T_array      = T,
+        altitudes_km = altitudes_km
+    )
+
+    # Save predictor
+    predictor.save(PREDICTOR_PATH)
+    print(f"Predictor saved to:\n  {PREDICTOR_PATH}")
+
+    # Build and save CSV output tables
+    rho_df = pd.DataFrame({"Date": dates})
+    T_df   = pd.DataFrame({"Date": dates})
+
+    for j, alt_km in enumerate(altitudes_km):
+        rho_df[f"Density_{alt_km}km_kg_m^-3"] = rho[:, j]
+        T_df[f"Temperature_{alt_km}km_K"]     = T[:, j]
+
+    rho_csv_path = os.path.join(output_dir, "jb2008_atmospheric_density_daily.csv")
+    T_csv_path   = os.path.join(output_dir, "jb2008_neutral_temperature_daily.csv")
+
+    rho_df.to_csv(rho_csv_path, index=False)
+    T_df.to_csv(T_csv_path,     index=False)
+
+    print(f"Saved atmospheric density CSV to:\n  {rho_csv_path}")
+    print(f"Saved neutral temperature CSV to:\n  {T_csv_path}")
+
+    # Plots
+    plt.rcParams["figure.figsize"] = (12, 5)
+    plt.rcParams["axes.grid"]      = True
+
+    for j, alt_km in enumerate(altitudes_km):
+        plt.figure()
+        plt.plot(dates, rho[:, j], linewidth=1.0)
+        plt.title(f"JB2008 Atmospheric Density at {alt_km} km (0°N, 0°E)")
+        plt.xlabel("Date")
+        plt.ylabel("Atmospheric Density [kg/m³]")
+        plt.tight_layout()
+        plt.savefig(
+            os.path.join(output_dir, f"atmospheric_density_{alt_km}km.png"),
+            dpi=300, bbox_inches="tight"
+        )
+        plt.close()
+
+        plt.figure()
+        plt.plot(dates, T[:, j], linewidth=1.0, color="tomato")
+        plt.title(f"JB2008 Neutral Temperature at {alt_km} km (0°N, 0°E)")
+        plt.xlabel("Date")
+        plt.ylabel("Neutral Temperature [K]")
+        plt.tight_layout()
+        plt.savefig(
+            os.path.join(output_dir, f"neutral_temperature_{alt_km}km.png"),
+            dpi=300, bbox_inches="tight"
+        )
+        plt.close()
+
+    print("Saved 10 plot files to output directory.")
+
+    # Launch interactive terminal query
+    terminal_query(predictor, output_dir=output_dir)
+
+    print("Done.")
