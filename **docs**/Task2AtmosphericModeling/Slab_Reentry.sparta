@@ -1,0 +1,240 @@
+# =============================================================================
+# SPARTA DSMC Input Script
+# Atomic Oxygen Fluence Simulation — Al-6061 Satellite at 250 km
+# Atmospheric conditions from NRLMSISE-2.0
+#
+# Usage:  sparta -in goce_ao_dsmc.sparta
+#         mpirun -np 16 sparta -in goce_ao_dsmc.sparta   (parallel)
+#
+# Required input files:
+#   250km_atmos.species   — species definitions + number densities
+#   250km_atmos.vss       — VSS collision parameters
+#   satellite_goce.surf   — triangulated surface (from STL conversion)
+#
+# Output files:
+#   log.sparta            — run log
+#   flux_surf.*.dat       — per-element AO flux dumps
+#   grid_flow.*.dat       — volumetric flow field
+#   stats.dat             — bulk macroscopic quantities
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# 1. SIMULATION BOX
+#    Satellite longest dimension ~5 m (GOCE). Domain = 10 body lengths upstream
+#    + 5 downstream + 3 lateral. At 250 km, Kn >> 1 (free molecular regime).
+#    Coordinate system: +z = ram direction (satellite z-axis aligned with orbit).
+#    Flow arrives from +z and travels in the -z direction through the domain.
+# ---------------------------------------------------------------------------
+
+seed            847291              # RNG seed (change for independent runs)
+dimension       3
+# x=absorb, y=absorb, z=outflow (emit/face will handle zhi as inflow source)
+boundary            o o o
+
+# Box (metres): x [-8, 8], y [-8, 8], z [-10, 20]
+#   z > 0  : upstream (flow source, 10 body lengths of clear approach)
+#   z < 0  : downstream wake (5 body lengths)
+#   x, y   : lateral, 3 body lengths each side
+create_box          -50.0 50.0  -50.0 50.0  -10.0 30.0
+global		    surfmax 500
+# Adaptive Cartesian grid — base 32x32x40 (more cells along ram axis)
+create_grid         32 32 80
+balance_grid        rcb cell          # recursive bisection for MPI load balance
+
+# ---------------------------------------------------------------------------
+# 2. GAS MIXTURE FROM NRLMSISE-2.0 @ 250 km
+#    Species file provides:  molecular weight, rotational DOF, vibrational temp
+#    VSS file provides:      d_ref, T_ref, omega (viscosity exponent), alpha
+#
+#    Number densities (m^-3) and mass fractions below are representative of
+#    NRLMSISE-2.0 at 250 km, 10.7 cm solar flux F10.7 = 150, Ap = 4.
+#    Override these if your .species file embeds different values.
+#
+#    Species   n (m^-3)     T_trans (K)
+#    O         4.20e15      1153
+#    N2        1.85e15      1153
+#    O2        1.10e14      1153
+#    He        4.00e14      1153
+#    N         5.00e13      1153
+#    Ar        1.60e12      1153
+# ---------------------------------------------------------------------------
+
+species             250km_atmos.species  O N2 O2 He N Ar H
+
+# Mixture: ram flow along -z direction (satellite frame: flow comes from +z)
+# vstream components:  vx=0  vy=0  vz=-7800 m/s  (LEO orbital speed ~7.8 km/s)
+# nrho = total number density (sum over all species above), m^-3
+
+global          nrho 2.147e15           
+global          vstream 0.0 0.0 -7700.0 
+global          temp 1153.0
+global 		fnum 1e14
+
+mixture 	AO O frac 1.0
+mixture         atmo  O N2 O2 He N Ar H
+# Individual species fractions (adjust to match your .species file)
+mixture         atmo O   frac 0.5576
+mixture         atmo N2  frac 0.4126
+mixture         atmo O2  frac 0.0143
+mixture         atmo N   frac 0.0142
+mixture         atmo He  frac 0.0010
+mixture         atmo Ar  frac 0.00028
+mixture         atmo H   frac 0.00002   # trace; keep for accuracy
+
+# Effective mean free path at 250 km ~ 200 m  → Kn >> 1, DSMC is valid
+
+# ---------------------------------------------------------------------------
+# 3. SURFACE GEOMETRY
+#    satellite_goce.surf must be in SPARTA surface format:
+#      points  <N>
+#      x y z
+#      ...
+#      triangles <M>
+#      p1 p2 p3
+#      ...
+#    Use stl2sparta.py (see companion script) if you only have the .stl.
+#    The surface is assumed centred at origin, ram-facing side toward +x.
+# ---------------------------------------------------------------------------
+
+read_surf           Al_Slab.surf
+
+# Group covering all surface elements (726 tris from your .surf file)
+# Adjust the upper id if your triangle count differs
+group               all_surf   surf   id 1:12
+
+# ---------------------------------------------------------------------------
+# 4. SURFACE PHYSICS
+#    surf_collide: gas-wall momentum/energy exchange
+#      diffuse — fully accommodated Maxwell-Boltzmann at wall temp T_wall
+#      Accommodation coefficient (alpha_n) = 0.9 for oxidised Al (literature)
+#    surf_react: chemical reaction / sticking
+#      prob — simple probability model for AO sticking to form Al2O3
+#      Reaction probability gamma_O on Al ~ 0.03–0.10; use 0.05 as baseline
+# ---------------------------------------------------------------------------
+
+surf_collide        sc_al    diffuse  300.0  0.9      # T_wall=300K, alpha=0.9
+surf_react          sr_ao    global   0.2   0.15       # AO reaction probability
+
+surf_modify         all_surf  collide sc_al  react sr_ao
+
+
+# ---------------------------------------------------------------------------
+# 5. GRID REFINEMENT NEAR SURFACE
+#    Cells near the body must be smaller than the local mean free path.
+#    At 250 km, MFP ~ 200 m, so even coarse cells are fine globally.
+#    Refine to ~0.5 m near surface to resolve flux gradients on panels.
+# ---------------------------------------------------------------------------
+
+# Grid refinement disabled for initial run; enable after confirming flow convergence
+# fix refine_near adapt 500 all refine coarsen value c_1[1] 10.0 2.0 combine yes thresh 0.5 cells 2 2 2 maxlevel 3
+
+# ---------------------------------------------------------------------------
+# 6. PARTICLE CREATION & INFLOW
+#    create_particles: seed initial particles in the domain
+#    fix emit/face: continuous supersonic inflow on the +z face (zhi)
+# ---------------------------------------------------------------------------
+
+# n=0 tells SPARTA to auto-calculate particle count from nrho and box volume
+#create_particles    atmo  n 0
+
+fix                 inflow emit/face atmo zhi perspecies yes
+
+# ---------------------------------------------------------------------------
+# 7. COMPUTES — diagnostics you need for the fluence extraction pipeline
+# ---------------------------------------------------------------------------
+
+# (a) Per-surface-element fluxes
+#     Columns: id  Nflux_O  Nflux_N2  Nflux_O2  Nflux_He  Nflux_N  &
+#              press  shx  shy  shz  ke
+
+compute 	csurf_AO surf all AO nflux press shx shy shz ke
+compute         csurf_all  surf  all  all nflux press  shx shy shz  ke
+
+# (b) Volume grid quantities (for flow-field visualisation)
+compute             cgrid  grid  all  all  nrho massrho u v w temp
+
+# (c) Global bulk stats
+compute             cbulk  thermal/grid  all  all  temp  press
+
+# ---------------------------------------------------------------------------
+# 8. TIME-AVERAGING FIXES
+#    Average over 200 samples (every 50 steps) to reduce statistical noise.
+# ---------------------------------------------------------------------------
+
+fix                 fsurf  ave/surf  all  50 200 10000  &
+                    c_csurf_all[1] c_csurf_all[2] c_csurf_all[3] c_csurf_all[4] c_csurf_all[5] &
+                    ave  running &
+                    #file  flux_surf_avg.dat
+
+fix 		    fsurf_AO ave/surf all 50 200 10000 &
+		    c_csurf_AO[1] c_csurf_AO[2] c_csurf_AO[3] c_csurf_AO[4] c_csurf_AO[5] &
+		    ave running &
+    		    #file flux_surf_AO.dat
+
+
+fix                 fgrid  ave/grid  all  50 200 10000  &
+                    c_cgrid[1] c_cgrid[2] c_cgrid[3] c_cgrid[4] c_cgrid[5] c_cgrid[6]  &
+                    ave  running 
+                    #file  grid_flow_avg.dat
+
+# ---------------------------------------------------------------------------
+# 9. DUMP OUTPUT — instantaneous snapshots for post-processing
+#    Dump every 1000 steps so you can track convergence.
+# ---------------------------------------------------------------------------
+
+# Surface flux dumps (used by Python fluence extractor)
+dump                dsurf  surf  all  1000  flux_surf.*.dat  &
+                    id c_csurf_all[1] c_csurf_all[2] c_csurf_all[3] c_csurf_all[4] c_csurf_all[5]
+
+dump 		    dsurf_AO surf all 1000 surf_AO.*.dat &
+     		    id c_csurf_AO[1] c_csurf_AO[2] c_csurf_AO[3] c_csurf_AO[4] c_csurf_AO[5]
+
+# Grid VTK dump for ParaView
+dump                dgrid  grid  all  1000  grid_flow.*.vtp  &
+                    c_cgrid[1] c_cgrid[2] c_cgrid[3] c_cgrid[4] c_cgrid[5] c_cgrid[6]
+
+# ---------------------------------------------------------------------------
+# 10. STATS OUTPUT
+# ---------------------------------------------------------------------------
+
+stats               500
+stats_style         step np ntouch ncoll nreact nscheck nsreact wall time
+
+# Write stats to file for convergence monitoring
+log                 stats.dat  append
+
+# ---------------------------------------------------------------------------
+# 11. RUN PARAMETERS
+#
+#    Timestep: dt = 0.1 × MFP / v_ram  ≈  0.1 × 200 / 7800  ≈  2.6e-3 s
+#    But SPARTA dt must also resolve collision timescale ~ 1/(n * sigma * v).
+#    At 250 km:  tau_coll ~ 1 / (6.7e15 × 1e-19 × 7800) ≈  0.19 s
+#    Use dt = 1e-3 s as a conservative starting value.
+#
+#    Total simulation time:
+#      Equilibration:  50 000 steps × 1e-3 s = 50 s  (many body transits)
+#      Production:    200 000 steps × 1e-3 s = 200 s
+#
+#    For a full orbital pass fluence, scale results by mission duration
+#    in post-processing (see fluence_extract.py companion script).
+# ---------------------------------------------------------------------------
+
+timestep            1.0e-3              # seconds per DSMC step
+
+# --- Equilibration run (no output, let flow establish) ---
+run                 10000
+
+# Reset stats after equilibration
+
+# --- Production run ---
+
+
+# =============================================================================
+# END OF INPUT SCRIPT
+#
+# After this run, use fluence_extract.py to:
+#   1. Parse flux_surf.*.dat
+#   2. Integrate flux × dt × n_steps per surface element
+#   3. Output fluence_map.csv  [surf_id, area_m2, fluence_AO_per_cm2, angle_deg]
+#   4. Feed fluence_map.csv into the LAMMPS ReaxFF bombardment stage
+# =============================================================================
