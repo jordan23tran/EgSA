@@ -1,0 +1,144 @@
+# In-progress input file for reentry of 30kg satellite from 250km
+# Temperature on the surface of the satellite due to collisions, In-line force on the surface due to collisions (drag), upwards force on the surface due to collisions (lift), flow of particles around structure over duration (to visualize particle cloud), relative speed of particles (to inform speed of spacecraft)
+
+
+seed 12345
+dimension 3
+boundary o o o
+
+global          gridcut 0.0
+global          surfmax 500
+global          fnum 1e14
+global          nrho 2.147e15
+global          temp 1153.0
+global          vstream 0.0 0.0 -7750.0
+
+#T = 1153K, 1256K exoT
+#rho = 7.540E-14 gram cm-3
+#velocity = 7750 m/s
+
+create_box 	-3 3 -3 3 -2 5
+create_grid     60 60 70
+balance_grid 	rcb part
+read_surf 	satellite_goce.surf
+
+
+species         250km_atmos.species O N2 O2 N He Ar H
+
+mixture         air O N2 O2 N He Ar H temp 1153
+
+mixture         air O   frac 0.5576
+mixture         air N2  frac 0.4126
+mixture         air O2  frac 0.0143
+mixture         air N   frac 0.0142
+mixture         air He  frac 0.0010
+mixture         air Ar  frac 0.00028
+mixture         air H   frac 0.00002
+#species		ar.species Ar
+#mixture		air Ar
+
+###### INFLOW & INTERACTIONS
+
+collide		vss air 250km_atmos.vss
+#surf_collide	frame diffuse 500.0 0.0
+#surf_modify 	all collide frame
+#create_particles    air n 10000 twopass
+fix 		inflow emit/face air zhi twopass
+
+###### DIAGNOSTICS
+
+#compute 	force surf all all fx fy fz
+#fix		forces ave/surf all 10 100 1000 c_force[*]
+#compute 	force2 reduce sum f_forces[1] f_forces[2] f_forces[3]
+##fix 		drag ave/time 10 100 1000 c_force2[3] file drag.dat
+#compute		temp temp
+##compute	tempgrid grid all air temp
+#fix 		ave_temp ave/time 100 10 1000 c_temp file temp.profile
+#compute		vel grid all air u v w
+#compute 	rho grid all air nrho
+##compute 	speed reduce sqrt c_vel[1]*c_vel[1] + c_vel[2]*c_vel[2] + c_vel[3]*c_vel[3]
+
+#compute 	surf_flux surf all all ke
+
+#stats 	1000
+#stats_style step cpu np nattempt ncoll nscoll c_force2[1]  c_force2[2] c_force2[3]
+
+###### VISUALIZATION
+
+#dump 	particles particle all 1000 particles*.dat id type x y z vx vy vz
+
+#dump 	flow grid all 1000 flow*.dat id c_vel[1] c_vel[2] c_vel[3] c_rho[*]
+
+
+
+###### DIAGNOSTICS
+
+# ── 1. PER-SURFACE QUANTITIES: forces, energy flux, temperature ──────────────
+# Compute instantaneous per-triangle forces AND total energy flux each step.
+# etot is needed by fix surf/temp; fx/fy/fz are needed for drag/lift.
+compute     surfQ   surf all all fx fy fz etot
+
+# Time-average the per-triangle values: sample every 10 steps, 
+# keep last 100 samples, output every 1000 steps.
+fix         aveSurf ave/surf all 10 100 1000 c_surfQ[*]
+
+# Radiative equilibrium surface temperature per triangle (Stefan-Boltzmann).
+# Args: group  Nevery  energy_source  Tinit  emissivity  custom-var-name
+# Tinit=500K (initial guess), emissivity=0.85 (typical satellite MLI/Al)
+# This writes a custom per-surf variable "s_temp_surf" readable by dump surf.
+fix         surfTemp surf/temp all 1000 f_aveSurf[4] 500.0 0.85 temp_surf
+# NOTE: f_aveSurf[4] is the etot column (4th column: fx=1, fy=2, fz=3, etot=4)
+# Also update the surf_collide model to use this evolving temperature:
+surf_collide    frame diffuse s_temp_surf 1.0
+surf_modify     all collide frame
+create_particles    air n 0 twopass
+
+# ── 2. SCALAR FORCE TOTALS: drag (fz) and lift (fz vs fy) ───────────────────
+# Sum per-triangle time-averaged forces across all triangles → global scalars.
+# Flow is in -Z, so drag = -f_aveSurf[3] summed; lift = f_aveSurf[2] summed.
+compute     dragLift    reduce sum f_aveSurf[1] f_aveSurf[2] f_aveSurf[3]
+# [1]=Fx (side), [2]=Fy (side), [3]=Fz (drag axis, expect negative = into flow)
+
+# Write time-series of total force components to a file.
+fix         forceDat ave/time 1 1 1000 c_dragLift[1] c_dragLift[2] c_dragLift[3] file forces.dat title1 "# step Fx Fy Fz(drag)"
+
+# ── 3. FLOW FIELD: velocity, number density, temperature ─────────────────────
+# Per-grid-cell flow quantities for ParaView volume visualization.
+compute     gridVel     grid all air u v w
+compute     gridRho     grid all air nrho
+compute     gridTemp    grid all air temp
+
+# Time-average grid quantities (sample every 10, keep 100, output every 1000).
+fix         aveGrid ave/grid all 10 100 1000 c_gridVel[1] c_gridVel[2] c_gridVel[3] c_gridRho[1] c_gridTemp[1]
+
+# ── 4. GLOBAL SCALAR DIAGNOSTICS ─────────────────────────────────────────────
+compute     tempGlobal  temp
+fix         aveTempGlob ave/time 100 10 1000 c_tempGlobal file temp_global.dat
+
+###### STATS
+stats       1000
+stats_style step cpu np nattempt ncoll nscoll c_dragLift[1] c_dragLift[2] c_dragLift[3]
+
+###### DUMPS
+
+# ── 5. PARTICLE DUMP: position + velocity (for particle cloud animation) ──────
+dump        partDump particle all 1000 particles.*.dat id type x y z vx vy vz
+
+# ── 6. GRID DUMP: time-averaged flow field (for ParaView volume rendering) ────
+# Outputs one file per timestep; use grid2paraview.py from tools/paraview/ 
+# to convert to .pvd for ParaView.
+dump        gridDump grid all 1000 flow.*.dat id xc yc zc f_aveGrid[1] f_aveGrid[2] f_aveGrid[3] f_aveGrid[4] f_aveGrid[5]
+
+# columns: id  x_center  y_center  z_center  u  v  w  nrho  temp
+
+# ── 7. SURFACE DUMP: per-triangle forces + temperature (for ParaView surface) ─
+# Use surf2paraview.py from tools/paraview/ to convert to .pvd for ParaView.
+dump        surfDump surf all 1000 surface.*.dat id f_aveSurf[1] f_aveSurf[2] f_aveSurf[3] f_aveSurf[4] s_temp_surf
+# columns: id  fx  fy  fz  etot  temperature
+
+
+
+###### SIMULATION
+
+timestep 	1e-7
+run 10000
