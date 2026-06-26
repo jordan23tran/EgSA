@@ -1,0 +1,68 @@
+import glob
+import matplotlib
+matplotlib.use("Agg")  # <-- Must be set BEFORE importing pyplot
+import matplotlib.pyplot as plt
+import imageio
+import numpy as np
+
+# ── 1. Collect files ──────────────────────────────────────────────────────────
+files = sorted(glob.glob("particles*.dat"))
+print("Files found:", files)
+
+# ── 2. Parser ─────────────────────────────────────────────────────────────────
+def read_particles(filename):
+    xs, ys, zs = [], [], []
+    vxs, vys, vzs = [], [], []
+    with open(filename, "r") as f:
+        lines = f.readlines()
+    read_data = False
+    for line in lines:
+        if "ITEM: ATOMS" in line:
+            read_data = True
+            continue
+        if read_data:
+            parts = line.split()
+            if len(parts) < 8:
+                continue
+            x, y, z = map(float, parts[2:5])
+            vx, vy, vz = map(float, parts[5:8])
+            xs.append(x);  ys.append(y);  zs.append(z)
+            vxs.append(vx); vys.append(vy); vzs.append(vz)
+    xs    = np.array(xs)
+    ys    = np.array(ys)
+    zs    = np.array(zs)
+    speed = np.sqrt(np.array(vxs)**2 + np.array(vys)**2 + np.array(vzs)**2)
+    return xs, ys, zs, speed
+
+# ── 3. Build frames  (everything stays INSIDE the loop) ───────────────────────
+fixed_max = 7
+frames = []
+for f in files:
+    xs, ys, zs, speed = read_particles(f)
+    fig, ax = plt.subplots(figsize=(6, 4))
+    H, _, _ = np.histogram2d(
+    zs, xs,
+    bins=[40,40]
+    )
+    sc = ax.imshow(
+        H.T,
+        origin='lower',
+        cmap="inferno",
+        vmin=0,
+        vmax=fixed_max
+    )
+    ax.set_title(f"DSMC Density Field: {f}")
+    ax.set_xlabel("z (flow direction)")
+    ax.set_ylabel("x")
+    plt.colorbar(sc, ax=ax, label="Particle Count (Density Proxy)")
+
+    fig.canvas.draw()                          # render to buffer
+    image = np.array(fig.canvas.buffer_rgba()) # grab RGBA pixels
+    image = image[:, :, :3]                    # drop alpha → RGB
+    frames.append(image)
+    plt.close(fig)                             # free memory
+
+
+# ── 4. Save GIF ───────────────────────────────────────────────────────────────
+imageio.mimsave("dsmc_T1_densities_animation.gif", frames, fps=1, loop=0)
+print(f"GIF saved with {len(frames)} frames!")
