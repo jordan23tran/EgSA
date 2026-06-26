@@ -1,0 +1,314 @@
+# =============================================================================
+# LAMMPS COMB3 Input Script
+# Atomic Oxygen Bombardment of Al Surface — Material Degradation
+#
+# POTENTIAL: Choudhary, Liang, Chernatynskiy, Phillpot, Sinnott (2015)
+#   "Charge optimized many-body (COMB) potential for Al2O3 materials,
+#    interfaces, and nanostructures"
+#   J. Phys.: Condens. Matter 27(30), 305004. DOI: 10.1088/0953-8984/27/30/305004
+#
+# NOTE: This run is Al/O ONLY. The available ffield.comb3 file does not
+# include validated Mg or Si cross-terms, so the slab is modeled as pure
+# Al rather than full Al-6061 alloy. Mg (~1.0%) and Si (~0.6%) are minor
+# surface dopants — their omission has a second-order effect on erosion
+# yield and oxide stoichiometry, but should be revisited if a compatible
+# Mg/Si COMB3 or ReaxFF parameterization becomes available later.
+#
+# Usage (single patch, patch index passed as variable):
+#   lmp -var PATCH_ID 42 -in ao_bombardment.lammps
+#
+# Batch over all nonzero patches via run_patches.sh companion script.
+#
+# Required files in working directory:
+#   ffield.comb3            — Choudhary et al. (2015) Al/O COMB3 potential
+#   lib.comb3                — COMB3 auxiliary library (C/O/H specific terms;
+#                               required by pair_style comb3 even if unused)
+#   fluence_map.csv          — output from fluence_extract.py
+#   ao_bombardment.lammps    — this file
+#
+# Output files per patch (written to ./results/patch_<ID>/):
+#   erosion.dat              — cumulative eroded atom count vs timestep
+#   oxide_thickness.dat      — Al2O3 layer thickness vs timestep
+#   roughness.dat            — surface RMS roughness vs timestep
+#   final.dump               — final atomic positions for OVITO visualisation
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# 0. PATCH PARAMETERS — read from fluence_map.csv via shell wrapper
+#    These variables are set by run_patches.sh using -var flags.
+#    Defaults below are for a standalone test run (tier-1 ram-facing patch).
+#
+#    PATCH_ID        surface element id from fluence_map.csv
+#    FLUENCE         AO fluence in AO/cm² for this patch
+#    ANGLE_DEG       mean angle of incidence from fluence_map.csv (degrees)
+#    ENERGY_EV       mean AO impact energy in eV (from DSMC; ~5 eV at 250 km)
+#    NX NY NZ        surface normal components (outward)
+# ---------------------------------------------------------------------------
+
+variable    PATCH_ID    index  1          # override with -var PATCH_ID <n>
+variable    FLUENCE     index  1.0e13     # AO/cm²
+variable    ANGLE_DEG   index  15.0       # degrees from normal
+variable    ENERGY_EV   index  5.0        # eV
+variable    NX          index  0.0
+variable    NY          index  0.0
+variable    NZ          index  1.0        # default: ram-facing (+z normal)
+
+# Derived: number of AO impacts to simulate
+# Slab face area = 6x6 nm = 36e-14 cm²
+# n_impacts = fluence × area (cap at 5000 for runtime)
+variable    SLAB_AREA   equal  36.0e-14   # cm²
+variable    N_RAW       equal  ${FLUENCE}*${SLAB_AREA}
+variable    N_IMPACTS   equal  "v_N_RAW < 5000 ? v_N_RAW : 5000"
+
+# AO velocity magnitude from impact energy: v = sqrt(2E/m_O)
+# m_O = 2.656e-26 kg, 1 eV = 1.602e-19 J
+# Result in Angstroms/ps (LAMMPS metal units)
+variable    V_AO        equal  sqrt(2.0*${ENERGY_EV}*1.602e-19/2.656e-26)*1.0e-10*1.0e12*(-1)
+# Negative because AO travels in -z direction (ram flow)
+
+# Impact angle: decompose velocity into z (normal) and x (tangential) components
+variable    VZ_AO       equal  ${V_AO}*cos(${ANGLE_DEG}*PI/180.0)
+variable    VX_AO       equal  ${V_AO}*sin(${ANGLE_DEG}*PI/180.0)
+
+# Output directory
+shell       mkdir -p results/patch_${PATCH_ID}
+variable    OUTDIR      string results/patch_${PATCH_ID}
+
+# ---------------------------------------------------------------------------
+# 1. INITIALISATION
+# ---------------------------------------------------------------------------
+
+units           metal           # eV, Angstroms, ps, K, bar
+atom_style      charge          # COMB3 requires per-atom charge (variable charge model)
+boundary        p p f           # periodic in x/y, free in z (surface normal)
+newton          on
+
+# ---------------------------------------------------------------------------
+# 2. AL SLAB CONSTRUCTION (pure Al — see note at top of file re: Mg/Si)
+#
+#    FCC Al lattice, a0 = 4.05 Å
+#    Slab: 15x15x8 unit cells = 60.75 x 60.75 x 32.4 Å
+#    ~14,000 Al atoms — large enough for AO impacts without edge effects
+#
+#    Native oxide: 2-3 nm Al2O3 pre-grown on top surface
+#    (representative of ambient-exposed Al before LEO exposure)
+#
+#    Atom types:  1=Al  2=O
+# ---------------------------------------------------------------------------
+
+lattice         fcc 4.05 origin .25 .25 .25 orient x 1 0 0 orient y 0 1 0 orient z 0 0 1
+region          box block 0 15 0 15 0 14 units lattice
+create_box      2 box
+
+# Al bulk slab (layers 0-8 unit cells in z)
+region          al_bulk block 0 15 0 15 0 8 units lattice
+create_atoms    1 region al_bulk
+
+# Pre-grown native Al2O3 layer (8-11 unit cells in z, ~12 Å thick)
+# Approximated as O atoms intercalated with Al in 3:2 O:Al stoichiometry
+region          oxide_region block 0 15 0 15 8 11 units lattice
+# create_atoms    1 region oxide_region
+# Add O atoms in interstitial positions within the oxide region
+#lattice         fcc 4.05 orient x 1 0 0 orient y 0 1 0 orient z 0 0 1 &
+                origin .25 .25 .25
+create_atoms    2 region oxide_region
+
+# Mass assignments
+mass            1  26.982   # Al
+mass            2  15.999   # O
+
+# ---------------------------------------------------------------------------
+# 3. FORCE FIELD — COMB3 (Choudhary et al. 2015, Al/O)
+#
+#    pair_coeff maps LAMMPS atom types to elements in ffield.comb3.
+#    The file also contains Ni parameters we are not using — only
+#    Al and O are mapped here, matching atom types 1 and 2 above.
+#
+#    COMB3 has built-in variable-charge electrostatics (QEq is internal
+#    to the pair style) — no separate fix qeq is needed, unlike ReaxFF.
+#
+#    lib.comb3 is required by the pair style even for non-C/O/H systems;
+#    it must be present in the working directory.
+# ---------------------------------------------------------------------------
+
+pair_style      comb3 polar_off
+pair_coeff      * * NiAlO_ffield.comb3  Al O
+
+# ---------------------------------------------------------------------------
+# 4. REGION DEFINITIONS FOR DIAGNOSTICS
+#
+#    bottom_fixed  : bottom 2 A - held rigid (bulk substrate boundary)
+#    thermostat    : next 10 A - Nose-Hoover NVT thermostat at 300 K
+#    active        : remainder up to oxide surface - Newtonian dynamics
+#    surface_zone  : top 15 A - where AO lands and oxide grows
+# ---------------------------------------------------------------------------
+
+variable        zlo_box     equal  zlo
+variable        zhi_box     equal  zhi
+
+region          bottom_fixed  block INF INF INF INF ${zlo_box} $(zlo+2.0)
+region          thermostat_r  block INF INF INF INF $(zlo+2.0) $(zlo+12.0)
+region          active_r      block INF INF INF INF $(zlo+12.0) INF
+region          surface_zone  block INF INF INF INF $(zhi-15.0) INF
+
+group           fixed_atoms   region bottom_fixed
+group           thermo_atoms  region thermostat_r
+group           active_atoms  region active_r
+group           surface_grp   region surface_zone
+group           mobile        subtract all fixed_atoms
+
+# Fix bottom layer rigid
+fix             freeze fixed_atoms setforce 0.0 0.0 0.0
+delete_atoms overlap 0.5 all all
+# ---------------------------------------------------------------------------
+# 5. INITIAL MINIMISATION
+#    Relax the slab (especially the artificial oxide layer) before dynamics
+# ---------------------------------------------------------------------------
+
+thermo          100
+thermo_style    custom step temp pe ke etotal press
+
+minimize        1.0e-6 1.0e-8 5000 50000
+
+reset_timestep  0
+
+# ---------------------------------------------------------------------------
+# 6. EQUILIBRATION — NVT at 300 K for 20 ps
+# ---------------------------------------------------------------------------
+
+timestep        0.25e-3         # 0.00025 ps = 0.25 fs — small step for COMB3's stiff bonds
+
+velocity        mobile create 300.0 482748 dist gaussian
+
+fix             nvt_eq mobile nvt temp 300.0 300.0 0.025
+
+thermo          500
+thermo_style    custom step temp pe ke press vol
+
+run             80000           # 80,000 x 0.25 fs = 20 ps equilibration
+
+unfix           nvt_eq
+reset_timestep  0
+
+# ---------------------------------------------------------------------------
+# 7. PRODUCTION — AO BOMBARDMENT
+#
+#    Protocol:
+#      a) Insert one AO atom above the surface with velocity directed at
+#         the surface at the DSMC-derived angle and energy
+#      b) Run 2000 steps (0.5 ps) — enough for impact, reaction, thermalisation
+#      c) Remove any AO that left the simulation box (sputtered or reflected)
+#      d) Apply thermostat to dissipate impact energy
+#      e) Repeat N_IMPACTS times
+#      f) Compute diagnostics after each impact
+#
+#    This sequential single-atom protocol is standard for AO bombardment MD.
+#    Simultaneous multi-atom insertion is avoided to prevent unphysical
+#    correlated impacts.
+# ---------------------------------------------------------------------------
+
+# Thermostat for production — only on thermostat region, not surface
+fix             nvt_prod thermo_atoms nvt temp 300.0 300.0 0.025
+
+# ---------------------------------------------------------------------------
+# 7a. DIAGNOSTIC COMPUTES
+# ---------------------------------------------------------------------------
+
+# Count O atoms in surface region (proxy for Al2O3 thickness/extent)
+variable        n_O_surf    equal  "count(surface_grp,type==2)"
+
+# Surface roughness: RMS of z-coordinates of topmost atoms
+compute         top_z       surface_grp property/atom z
+variable        z_mean      equal  "ave(surface_grp,c_top_z)"
+variable        Ra          equal  "sqrt(ave(surface_grp,(c_top_z - v_z_mean)^2))"
+
+# Track atoms that have left through the top boundary (eroded/sputtered)
+variable        n_eroded    equal  "count(all) - count(fixed_atoms) - count(thermo_atoms) - count(active_atoms)"
+
+# Oxide thickness estimate: distance from box top to mean surface atom height
+variable        oxide_thick equal  "(zhi - v_z_mean)"
+
+# ---------------------------------------------------------------------------
+# 7b. OUTPUT FIXES
+# ---------------------------------------------------------------------------
+
+fix             erosion_out   all ave/time 1 1 2000  &
+                v_n_eroded                           &
+                file ${OUTDIR}/erosion.dat           &
+                title1 "# step  n_eroded_atoms"
+
+fix             oxide_out     all ave/time 1 1 2000  &
+                v_n_O_surf v_oxide_thick             &
+                file ${OUTDIR}/oxide_thickness.dat   &
+                title1 "# step  n_O_in_surface  oxide_thickness_A"
+
+fix             rough_out     all ave/time 1 1 2000  &
+                v_Ra                                 &
+                file ${OUTDIR}/roughness.dat         &
+                title1 "# step  Ra_Angstroms"
+
+# Thermo output
+thermo          2000
+thermo_style    custom step temp pe ke press &
+                v_n_eroded v_n_O_surf v_Ra
+
+# ---------------------------------------------------------------------------
+# 7c. IMPACT LOOP
+# ---------------------------------------------------------------------------
+
+variable        i           loop  ${N_IMPACTS}
+variable        impact_x    equal  random(2.0,58.0,${i}*1000+1)   # random xy landing
+variable        impact_y    equal  random(2.0,58.0,${i}*1000+2)
+variable        insert_z    equal  $(zhi-2.0)                      # 2 A above surface
+
+label           impact_loop
+
+    # Insert one O atom (type 2) above the surface
+    create_atoms    2 single ${impact_x} ${impact_y} ${insert_z} units box
+
+    # Assign impact velocity: -z (toward surface) + x tangential for angle
+    # Identify the newly created atom (highest atom id)
+    variable        new_id  equal  "id[count(all)]"
+    group           ao_atom id ${new_id}
+
+    velocity        ao_atom set ${VX_AO} 0.0 ${VZ_AO} units box
+
+    # Run impact dynamics
+    run             2000
+
+    # Remove only unreacted/reflected AO: O atoms (type 2) above the original surface height
+    # Uses a temporary region above the oxide top rather than the full surface_zone
+    region          ao_exit block INF INF INF INF $(zhi-3.0) INF
+    group           ao_reflected type 2
+    group           ao_reflected region ao_exit
+    delete_atoms    group ao_reflected compress no
+    group           ao_reflected delete
+    region          ao_exit delete
+  
+
+next            i
+jump            ao_bombardment.lammps impact_loop
+
+# ---------------------------------------------------------------------------
+# 8. FINAL DUMP — full trajectory for OVITO post-processing
+# ---------------------------------------------------------------------------
+
+dump            final_dump all custom 1 ${OUTDIR}/final.dump &
+                id type x y z q vx vy vz
+dump_modify     final_dump sort id
+run             0
+undump          final_dump
+
+# Also write a restart file
+write_restart   ${OUTDIR}/final.restart
+
+# =============================================================================
+# END OF BOMBARDMENT SCRIPT
+#
+# Post-processing:
+#   1. OVITO: load final.dump -> coordination analysis -> identify Al2O3 regions
+#   2. plot erosion.dat         -> erosion yield vs AO dose
+#   3. plot oxide_thickness.dat -> oxide growth curve
+#   4. plot roughness.dat       -> Ra vs fluence (drag-relevant)
+#   5. run postprocess.py to map per-patch results back to satellite geometry
+# =============================================================================

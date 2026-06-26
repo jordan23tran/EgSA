@@ -1,0 +1,12 @@
+# VSS parameters for 250km VLEO atmosphere
+# Format: species-ID  diam(m)  omega  tref(K)  alpha
+# tref = 273K (standard reference), alpha = 1.0 (VHS mode)
+# Diameters taken from like-species pairs in original file
+
+O     4.00e-10  0.77   273.0  1.00
+N2    4.17e-10  0.74   273.0  1.00
+O2    4.18e-10  0.77   273.0  1.00
+N     3.70e-10  0.77   273.0  1.00
+He    2.60e-10  0.67   273.0  1.00
+Ar    3.40e-10  0.74   273.0  1.00
+H     0.50e-10  0.77   273.0  1.00
